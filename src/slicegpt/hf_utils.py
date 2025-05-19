@@ -11,7 +11,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 from .layernorm_fusion import fuse_modules, replace_layers
 from .model_adapter import ModelAdapter, SlicingConfig
 from .rotate import slice_rotated_model
-
+from .adapters.gemma_adapter import GemmaModelAdapter
 
 def do_not_initialize(func):
     """
@@ -88,14 +88,38 @@ def get_model_and_tokenizer(
         model_path if local_model else 'Hugging Face',
     )
 
-    model_adapter = ModelAdapter.from_model(
-        model_name,
-        model_path=model_path,
-        model_type=model_type,
-        dtype=dtype,
-        local_files_only=local_model,
-        token=token,
-    )
+    #  修改开始  #################################################################
+    if model_name.startswith("facebook/opt") or model_name.startswith("meta-llama/Llama-2") or model_name.startswith("meta-llama/Meta-Llama-3"):
+        model_adapter = LlamaModelAdapter.from_model(
+            model_name,
+            model_path=model_path,
+            model_type=model_type,
+            dtype=dtype,
+            local_files_only=local_model,
+            token=token,
+        )
+    elif model_name.startswith("microsoft/phi-2"):
+        model_adapter = Phi2ModelAdapter.from_model(
+            model_name,
+            model_path=model_path,
+            model_type=model_type,
+            dtype=dtype,
+            local_files_only=local_model,
+            token=token,
+        )
+    elif model_name.startswith("google/gemma"):  # 添加Gemma支持
+        model_adapter = GemmaModelAdapter.from_model(
+            model_name,
+            model_path=model_path,
+            model_type=model_type,
+            dtype=dtype,
+            local_files_only=local_model,
+            token=token,
+        )
+    else:
+        raise ValueError(f"Model {model_name} is not supported yet.")
+    #  修改结束  #################################################################
+
 
     model = model_adapter.model
     model.seqlen = model.config.max_position_embeddings

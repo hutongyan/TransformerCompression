@@ -34,6 +34,7 @@ def get_dataset(name: str) -> datasets.DatasetDict:
             "cols_to_remove": ['url', 'timestamp'],
         },
         "alpaca": {"path": "tatsu-lab/alpaca", "cols_to_remove": ['input', 'output', 'instruction']},
+        "NuminaMath-CoT": {"path": "AI-MO/NuminaMath-CoT", "config_name": "default"},
     }
 
     if name not in ds_properties:

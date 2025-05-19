@@ -118,7 +118,7 @@ def finetuning_arg_parser(interactive: bool = True) -> argparse.Namespace:
         "--ppl-eval-dataset",
         type=str,
         help="Dataset to evaluate perplexity.",
-        choices=["wikitext2", "ptb", "c4", "alpaca"],
+        choices=["wikitext2", "ptb", "c4", "alpaca", "NuminaMath-CoT"],
         default="wikitext2",
     )
     parser.add_argument(
@@ -137,7 +137,7 @@ def finetuning_arg_parser(interactive: bool = True) -> argparse.Namespace:
         "--finetune-dataset",
         type=str,
         help="Dataset to finetune on.",
-        choices=["wikitext2", "ptb", "c4", "alpaca"],
+        choices=["wikitext2", "ptb", "c4", "alpaca", "NuminaMath-CoT"],
         default="wikitext2",
     )
     parser.add_argument(
@@ -227,8 +227,26 @@ def finetuning_main(args: argparse.Namespace) -> None:
         logging.info(f'Failed to initialize wandb: {e}, continuing without wandb')
         wandb.init(project=args.wandb_project, mode='disabled')
 
+
+    # This line was commented out during troubleshooting. Uncomment if needed based on memory.
+    # if args.sliced_model_path:
+    #     # load the sliced model
+    #     logging.info(f"Loading sliced {args.model} model from {args.sliced_model_path} with sparsity {args.sparsity}")
+    #     model_adapter, tokenizer = hf_utils.load_sliced_model(
+    #         args.model,
+    #         args.sliced_model_path,
+    #         sparsity=args.sparsity,
+    #         token=args.hf_token,
+    #         round_interval=args.round_interval,
+    #     )
+    # else:
+    #     # load the original model
+    #     logging.info(f"Loading {args.model} model")
+    #     model_adapter, tokenizer = hf_utils.get_model_and_tokenizer(args.model, args.model_path, token=args.hf_token)
+
+    # Based on successful runs, we now know the sliced model is loaded via hf_utils.load_sliced_model
+    # If using a sliced model, this branch will be taken:
     if args.sliced_model_path:
-        # load the sliced model
         logging.info(f"Loading sliced {args.model} model from {args.sliced_model_path} with sparsity {args.sparsity}")
         model_adapter, tokenizer = hf_utils.load_sliced_model(
             args.model,
@@ -237,10 +255,18 @@ def finetuning_main(args: argparse.Namespace) -> None:
             token=args.hf_token,
             round_interval=args.round_interval,
         )
+    elif args.model_path:
+         # Load model from a local path
+         logging.info(f"Loading {args.model} model from {args.model_path}")
+         # Need to determine the correct adapter for loading from local path if not sliced
+         # Assuming hf_utils.get_model_and_tokenizer handles this for standard HF format
+         model_adapter, tokenizer = hf_utils.get_model_and_tokenizer(args.model, args.model_path, token=args.hf_token)
     else:
-        # load the original model
-        logging.info(f"Loading {args.model} model")
-        model_adapter, tokenizer = hf_utils.get_model_and_tokenizer(args.model, args.model_path, token=args.hf_token)
+        # Load model from Hugging Face Hub
+        logging.info(f"Loading {args.model} model from Hugging Face Hub")
+        # Assuming hf_utils.get_model_and_tokenizer handles this for standard HF models by name
+        model_adapter, tokenizer = hf_utils.get_model_and_tokenizer(args.model, None, token=args.hf_token)
+
 
     # get the dataset for perplexity evaluation
     ppl_ds = data_utils.get_dataset(args.ppl_eval_dataset)
@@ -254,129 +280,218 @@ def finetuning_main(args: argparse.Namespace) -> None:
         seed=args.seed,
     )
 
+    # This block handles model distribution, which helps with OOM
     if args.distribute_model:
         gpu_utils.distribute_model(model_adapter)
     else:
-        model_adapter.model.to(config.device)
+        model_adapter.model.to(config.device) # Ensure model is on specified device if not distributed
 
     # compute perplexity before finetuning
-    dataset_ppl = gpu_utils.evaluate_ppl(model_adapter.model, model_adapter.model.config.pad_token_id, ppl_eval_loader)
-    logging.info(f'PPL before finetuning: {dataset_ppl:.4f}')
-    wandb.log({"pre_finetune_ppl": dataset_ppl})
+    # Note: Perplexity evaluation here is on the base (sliced) model before LoRA finetuning
+    # The finetuning loss evaluation is handled by the Trainer
+    if ppl_eval_loader: # Only evaluate PPL if dataset is loaded
+      logging.info(f'PPL before finetuning calculation started...')
+      # Ensure model is in evaluation mode for PPL calculation
+      model_adapter.model.eval()
+      with torch.no_grad(): # No gradients needed for PPL eval
+          dataset_ppl = gpu_utils.evaluate_ppl(model_adapter.model, model_adapter.model.config.pad_token_id, ppl_eval_loader)
+      logging.info(f'PPL before finetuning: {dataset_ppl:.4f}')
+      wandb.log({"pre_finetune_ppl": dataset_ppl})
+    else:
+      logging.info('PPL evaluation dataset not loaded, skipping pre-finetuning PPL evaluation.')
 
-    utils.cleanup_memory()
+
+    utils.cleanup_memory() # Clean up memory after PPL eval
 
     # get the dataset for finetuning
     finetune_ds = data_utils.get_dataset(args.finetune_dataset)
-    finetune_train_loader = data_utils.prepare_dataloader(
-        dataset=finetune_ds["train"],
-        tokenizer=tokenizer,
-        max_seqlen=args.finetune_train_seqlen,
-        batch_size=args.finetune_train_batch_size,
-        nsamples=args.finetune_train_nsamples,
-        varied_seqlen=args.varied_seqlen,
-        seed=args.seed,
-    )
-    finetune_test_loader = data_utils.prepare_dataloader(
-        dataset=finetune_ds["test"],
-        tokenizer=tokenizer,
-        max_seqlen=args.finetune_test_seqlen,
-        batch_size=args.finetune_test_batch_size,
-        nsamples=args.finetune_test_nsamples,
-        varied_seqlen=args.varied_seqlen,
-        seed=args.seed,
-    )
 
-    lora_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        task_type=TaskType.CAUSAL_LM,
-        target_modules=lora_target_map(args.model)[args.lora_target_option],
-    )
+    # --- Check if finetuning dataset is available and process only if it is ---
+    if finetune_ds and "train" in finetune_ds and "test" in finetune_ds:
 
-    model = model_adapter.model
-    lora_model = get_peft_model(model, lora_config)
-    lora_model.print_trainable_parameters()
+        finetune_train_loader = data_utils.prepare_dataloader(
+            dataset=finetune_ds["train"],
+            tokenizer=tokenizer,
+            max_seqlen=args.finetune_train_seqlen,
+            batch_size=args.finetune_train_batch_size,
+            nsamples=args.finetune_train_nsamples,
+            varied_seqlen=args.varied_seqlen,
+            seed=args.seed,
+        )
+        finetune_test_loader = data_utils.prepare_dataloader(
+            dataset=finetune_ds["test"],
+            tokenizer=tokenizer,
+            max_seqlen=args.finetune_test_seqlen,
+            batch_size=args.finetune_test_batch_size,
+            nsamples=args.finetune_test_nsamples,
+            varied_seqlen=args.varied_seqlen,
+            seed=args.seed,
+        )
 
-    # create optimizer and scheduler
-    optimizer, lr_scheduler = get_optimizer_and_scheduler(lora_model, finetune_ds["train"], args)
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            task_type=TaskType.CAUSAL_LM,
+            # The lora_target_map function needs to support the specified model
+            target_modules=lora_target_map(args.model)[args.lora_target_option],
+        )
 
-    training_args = TrainingArguments(
-        output_dir=args.st_checkpoint_dir,  # output directory
-        num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.finetune_train_batch_size,  # batch size per device during training
-        per_device_eval_batch_size=args.finetune_test_batch_size,  # batch size for evaluation
-        logging_steps=args.logging_steps,
-        save_steps=args.save_steps,
-        save_total_limit=args.save_total_limit,
-        disable_tqdm=False,
-        load_best_model_at_end=True,
-        eval_steps=args.eval_steps,
-        evaluation_strategy=args.evaluation_strategy,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,  # lower eval_loss is better,
-        gradient_checkpointing=True,
-    )
+        model = model_adapter.model # Get the base model again
 
-    if not args.distribute_model:
-        training_args._n_gpu = 1
+        # Move model to device before applying PEFT if not distributed
+        if not args.distribute_model:
+             model.to(config.device) # Ensure base model is on device before wrapping with PEFT
 
-    trainer = CustomTrainer(
-        model=lora_model,
-        tokenizer=tokenizer,
-        train_loader=finetune_train_loader,
-        test_loader=finetune_test_loader,
-        args=training_args,
-        optimizers=(optimizer, lr_scheduler),
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience)],
-    )
+        lora_model = get_peft_model(model, lora_config)
+        lora_model.print_trainable_parameters()
 
-    # required to enable gradient_checkpointing
-    lora_model.enable_input_require_grads()
+        # create optimizer and scheduler
+        # Use finetune_ds["train"] dataset for length calculation as needed by scheduler
+        optimizer, lr_scheduler = get_optimizer_and_scheduler(lora_model, finetune_ds["train"], args)
 
-    lora_model.train()
-    trainer.train()
+        # Define Training Arguments
+        training_args = TrainingArguments(
+            output_dir=args.st_checkpoint_dir,  # output directory
+            num_train_epochs=args.epochs,
+            per_device_train_batch_size=args.finetune_train_batch_size,  # batch size per device during training
+            per_device_eval_batch_size=args.finetune_test_batch_size,  # batch size for evaluation
+            logging_steps=args.logging_steps,
+            save_steps=args.save_steps,
+            save_total_limit=args.save_total_limit,
+            disable_tqdm=False,
+            load_best_model_at_end=True, # Load best model based on eval_steps/metric
+            eval_steps=args.eval_steps,
+            evaluation_strategy=args.evaluation_strategy, # e.g., "steps"
+            # metric_for_best_model="eval_loss", # Uncomment and set if you want to save based on a specific metric
+            greater_is_better=False,  # Usually True for accuracy, False for loss
+            gradient_accumulation_steps=args.gradient_accumulation_steps, # Add accumulation steps
+            # gradient_checkpointing=False, # Keep False for debugging OOM related to checkpointing interactions
+            # Setting gradient_checkpointing requires model.gradient_checkpointing_enable() which is done below
 
-    if args.save_dir:
-        rft_dir = args.save_dir
-        if not os.path.exists(rft_dir):
-            os.makedirs(rft_dir, exist_ok=True)
+        )
 
-        model_file = os.path.join(rft_dir, os.path.basename(args.model) + "_" + str(args.sparsity) + ".pt")
+        # Enable gradient checkpointing *after* wrapping with PEFT and setting training_args
+        # Only enable if desired and training_args.gradient_checkpointing is True
+        # if training_args.gradient_checkpointing: # Check if it's True in args
+        #    lora_model.gradient_checkpointing_enable() # Enable on the model
 
-        # save peft model as a standard pt model
-        merged_model = lora_model.merge_and_unload()
+        # Ensure n_gpu is correctly set for non-distributed training
+        if not args.distribute_model:
+             training_args._n_gpu = 1
+        else:
+             # If distributed, accelerate will handle n_gpu
+             pass # Let accelerate manage distribution and device placement
 
-        torch.save(merged_model.state_dict(), model_file)
 
-        if args.sliced_model_path:
-            sliced_model_dir = args.sliced_model_path
-            try:
-                # copy all config files (tokenizer, model and slicing configs)
-                for file in pathlib.Path(sliced_model_dir).glob("*.json"):
-                    if 'safetensors' not in str(file):
-                        shutil.copy(str(file), rft_dir)
-                # copy all tokenizer models
-                for file in pathlib.Path(sliced_model_dir).glob("*token*.model"):
-                    shutil.copy(str(file), rft_dir)
-                # copy vocab merges if any
-                for file in pathlib.Path(sliced_model_dir).glob("merges.txt"):
-                    shutil.copy(str(file), rft_dir)
-            except OSError as e:
-                logging.info(f'Failed to copy configs and tokenizer files: {e}')
+        trainer = CustomTrainer(
+            model=lora_model,
+            tokenizer=tokenizer,
+            train_loader=finetune_train_loader, # Use CustomTrainer's dataloaders
+            test_loader=finetune_test_loader,
+            args=training_args,
+            optimizers=(optimizer, lr_scheduler),
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience)],
+        )
 
-        logging.info(f"Saved sliced and finetuned model to {args.save_dir}")
+        # required to enable input grads for gradient_checkpointing if it's True
+        # lora_model.enable_input_require_grads() # This is only needed if gradient_checkpointing is True
 
-    utils.cleanup_memory()
+        # Set model to train mode before training
+        lora_model.train()
+        logging.info("Starting finetuning training...")
+        trainer.train()
+        logging.info("Finetuning training finished.")
 
-    # compute perplexity after finetuning
-    dataset_ppl = gpu_utils.evaluate_ppl(lora_model, model.config.pad_token_id, ppl_eval_loader)
-    logging.info(f'PPL after finetuning: {dataset_ppl:.4f}')
-    wandb.log({"post_finetune_ppl": dataset_ppl})
+        # Ensure model is in evaluation mode after training if evaluating PPL again or saving
+        lora_model.eval()
 
-    Reporter()(ppl=dataset_ppl)
-    syne_tune.Reporter()(ppl=dataset_ppl)
+
+        # --- Save the fine-tuned model ---
+        if args.save_dir:
+            rft_dir = args.save_dir
+            if not os.path.exists(rft_dir):
+                os.makedirs(rft_dir, exist_ok=True)
+
+            # Save the PEFT adapter weights
+            logging.info(f"Saving LoRA adapter weights to {rft_dir}")
+            lora_model.save_pretrained(rft_dir)
+            logging.info("LoRA adapter weights saved.")
+
+            # You might also want to save the tokenizer and the base model config here
+            # The tokenizer is already loaded, just save it
+            logging.info(f"Saving tokenizer to {rft_dir}")
+            tokenizer.save_pretrained(rft_dir)
+            logging.info("Tokenizer saved.")
+
+            # The config of the base model is needed
+            logging.info(f"Saving base model config to {rft_dir}")
+            model_adapter.model.config.save_pretrained(rft_dir) # Save the config from the sliced base model
+            logging.info("Base model config saved.")
+
+
+            # Optional: If you want to save the *merged* model (base + lora)
+            # This is memory intensive and might not be needed if saving adapter is sufficient
+            # print("Merging and saving merged model...")
+            # merged_model = lora_model.merge_and_unload()
+            # merged_model_file = os.path.join(rft_dir, "merged_model.bin") # Or .safetensors
+            # torch.save(merged_model.state_dict(), merged_model_file)
+            # print(f"Merged model state dict saved to {merged_model_file}")
+
+
+            # The original script's save logic seems to save the *merged* state dict as a .pt file
+            # Let's replicate that if needed, but saving the adapter is standard for PEFT
+            # model_file = os.path.join(rft_dir, os.path.basename(args.model) + "_" + str(args.sparsity) + ".pt")
+            # logging.info(f"Merging and saving merged model state dict to {model_file}")
+            # merged_model_state_dict = lora_model.merge_and_unload().state_dict()
+            # torch.save(merged_model_state_dict, model_file)
+            # logging.info("Merged state dict saved.")
+
+            # The original script also tries to copy config/tokenizer files from sliced_model_dir
+            # Saving tokenizer and config directly above is cleaner
+            # if args.sliced_model_path:
+            #      sliced_model_dir = args.sliced_model_path
+            #      try:
+            #          # copy all config files (tokenizer, model and slicing configs)
+            #          for file in pathlib.Path(sliced_model_dir).glob("*.json"):
+            #              if 'safetensors' not in str(file):
+            #                  shutil.copy(str(file), rft_dir)
+            #          # copy all tokenizer models
+            #          for file in pathlib.Path(sliced_model_dir).glob("*token*.model"):
+            #              shutil.copy(str(file), rft_dir)
+            #          # copy vocab merges if any
+            #          for file in pathlib.Path(sliced_model_dir).glob("merges.txt"):
+            #              shutil.copy(str(file), rft_dir)
+            #      except OSError as e:
+            #          logging.info(f'Failed to copy configs and tokenizer files: {e}')
+
+
+        logging.info(f"Finetuning process completed. Results saved to {args.save_dir}")
+
+    else:
+        logging.info("Finetuning dataset not loaded or available, skipping finetuning.")
+        # If not finetuning, you might skip the trainer part and only do PPL eval if args allow
+
+
+    utils.cleanup_memory() # Clean up memory after finetuning
+
+    # compute perplexity after finetuning (on the lora_model if finetuning happened)
+    # Ensure model is in evaluation mode
+    model_to_eval_ppl = lora_model if 'lora_model' in locals() and lora_model is not None else model_adapter.model
+    model_to_eval_ppl.eval()
+
+    if ppl_eval_loader: # Only evaluate PPL if dataset is loaded
+      logging.info(f'PPL after finetuning calculation started...')
+      with torch.no_grad(): # No gradients needed for PPL eval
+          dataset_ppl = gpu_utils.evaluate_ppl(model_to_eval_ppl, model_adapter.model.config.pad_token_id, ppl_eval_loader)
+      logging.info(f'PPL after finetuning: {dataset_ppl:.4f}')
+      wandb.log({"post_finetune_ppl": dataset_ppl})
+
+      # Reporter calls are usually for Syne Tune integration
+      Reporter()(ppl=dataset_ppl)
+      syne_tune.Reporter()(ppl=dataset_ppl)
+    else:
+        logging.info('PPL evaluation dataset not loaded, skipping post-finetuning PPL evaluation.')
 
 
 if __name__ == "__main__":
@@ -385,4 +500,12 @@ if __name__ == "__main__":
 
     finetuning_args = finetuning_arg_parser()
     process_finetuning_args(finetuning_args)
+
+    # Check if CUDA is available and set device if not explicitly specified
+    if finetuning_args.device is None:
+        finetuning_args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # Convert device string to torch.device object and store in config
+    config.device = torch.device(finetuning_args.device)
+
+
     finetuning_main(finetuning_args)

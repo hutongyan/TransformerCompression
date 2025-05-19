@@ -34,6 +34,16 @@ TASK_METRIC_MAP = {
     "hellaswag": "acc_norm,none",
     "piqa": "acc_norm,none",
     "winogrande": "acc,none",
+    "gsm8k": "exact_match,get-answer",
+    "gsm8k_cot": "exact_match,flexible-extract",
+    "minerva_math": "exact_match,none",
+    "minerva_math_algebra": "exact_match,none",
+    "minerva_math_counting_and_prob": "exact_match,none",
+    "minerva_math_geometry": "exact_match,none",
+    "minerva_math_intermediate_algebra": "exact_match,none",
+    "minerva_math_num_theory": "exact_match,none",
+    "minerva_math_prealgebra": "exact_match,none",
+    "minerva_math_precalc": "exact_match,none",
 }
 
 
@@ -69,7 +79,7 @@ def eval_arg_parser(interactive: bool = True) -> argparse.Namespace:
         help="Interval for rounding the weights (the best value may depend on your hardware)",
     )
     parser.add_argument('--hf-token', type=str, default=os.getenv('HF_TOKEN', None))
-    parser.add_argument("--batch-size", type=int, default=64, help="Batch size for evaluating with lm eval harness.")
+    parser.add_argument("--batch-size", type=int, default=16, help="Batch size for evaluating with lm eval harness.")
     parser.add_argument(
         "--distribute-model",
         action="store_true",

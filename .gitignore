@@ -5,6 +5,7 @@
 
 experiments/results*
 experiments/sliced_models
+pruned_model
 
 # logs
 log/

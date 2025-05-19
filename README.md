@@ -1,3 +1,18 @@
+# Run Slicegpt for Llama3 and Gemma
+To install dependencies
+```
+pip install -e .[experiment,finetune]
+```
+
+Slice
+```
+CUDA_VISIBLE_DEVICES=1 python run_slicegpt.py --model google/gemma-2-9b --cal-dataset NuminaMath-CoT --sparsity 0.4 --save-dir ./sliced_gemma
+```
+
+Recovery:
+```
+CUDA_VISIBLE_DEVICES=0,1,2,3 python run_finetuning.py     --model meta-llama/Meta-Llama-3-8B     --sliced-model-path /home/guest/zsf/hty/TransformerCompression/pruned_model/llama     --save-dir /home/guest/zsf/hty/TransformerCompression/finetuned_model/llama     --sparsity 0.40     --device cuda:0     --ppl-eval-dataset alpaca     --finetune-dataset NuminaMath-CoT     --finetune-train-nsamples 1000     --finetune-train-seqlen 1024     --finetune-train-batch-size 3     --lora-alpha 10     --lora-r 32     --lora-dropout 0.05     --lora-target-option attn_head_and_mlp     --eval-steps 1000     --save-steps 1000     --no-wandb
+```
 # Transformer Compression with SliceGPT
 
 This repository contains the code for the paper [SliceGPT](https://arxiv.org/abs/2401.15024) (ICLR'24). Also discussed on [Hugging Face](https://huggingface.co/papers/2401.15024). 
